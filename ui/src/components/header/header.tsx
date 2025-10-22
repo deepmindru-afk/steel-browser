@@ -22,12 +22,12 @@ export const Header = () => {
           {currentSessionId ? (
             <>
               <SteelIcon />
-              Session
+              Portal
             </>
           ) : (
             <>
               <SteelIcon />
-              Session
+              Portal
             </>
           )}
         </div>
@@ -54,18 +54,11 @@ export const Header = () => {
       <nav className="flex-1 flex justify-end">
         <div className="flex gap-2 items-center">
           <a
-            href="https://docs.steel.dev"
+            href="https://www.portalos.ru"
             target="_blank"
             className="rounded-md opacity-90 bg-transparent flex h-10 px-4 justify-center items-center gap-3 text-primary hover:bg-[rgba(238,206,254,0.13)] font-inter text-base font-normal leading-6 cursor-pointer"
           >
-            Docs
-          </a>
-          <a
-            href="https://discord.gg/steel-dev"
-            target="_blank"
-            className="rounded-md opacity-90 bg-transparent flex h-10 px-4 justify-center items-center gap-3 text-primary hover:bg-[rgba(238,206,254,0.13)] font-inter text-base font-normal leading-6 cursor-pointer"
-          >
-            Discord
+            More
           </a>
         </div>
       </nav>
