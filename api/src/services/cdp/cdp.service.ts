@@ -76,6 +76,7 @@ import {
   BrowserLogger,
 } from "./instrumentation/browser-logger.js";
 import { executeBestEffort, executeCritical, executeOptional } from "./utils/error-handlers.js";
+import { TimezoneFetcher } from "../timezone-fetcher.service.js";
 
 export class CDPService extends EventEmitter {
   private logger: FastifyBaseLogger;
@@ -106,6 +107,7 @@ export class CDPService extends EventEmitter {
   private proxyWebSocketHandler:
     | ((req: IncomingMessage, socket: Duplex, head: Buffer) => Promise<void>)
     | null = null;
+  private disconnectHandler: () => Promise<void> = () => this.endSession();
 
   constructor(
     config: { keepAlive?: boolean },
@@ -137,6 +139,11 @@ export class CDPService extends EventEmitter {
     this.primaryPage = null;
     this.currentSessionConfig = null;
     this.shuttingDown = false;
+
+    // Initialize timezone fetcher for cold start
+    const timezoneFetcher = new TimezoneFetcher(logger);
+    const coldStartTimezone = timezoneFetcher.getTimezone(undefined, this.defaultTimezone);
+
     this.defaultLaunchConfig = {
       options: {
         headless: env.CHROME_HEADLESS,
@@ -146,7 +153,7 @@ export class CDPService extends EventEmitter {
       blockAds: true,
       extensions: [],
       userDataDir: env.CHROME_USER_DATA_DIR || path.join(os.tmpdir(), "steel-chrome"),
-      timezone: Promise.resolve(this.defaultTimezone),
+      timezone: coldStartTimezone,
       userPreferences: {
         plugins: {
           always_open_pdf_externally: true,
@@ -186,6 +193,10 @@ export class CDPService extends EventEmitter {
     handler: ((req: IncomingMessage, socket: Duplex, head: Buffer) => Promise<void>) | null,
   ): void {
     this.proxyWebSocketHandler = handler;
+  }
+
+  public setDisconnectHandler(handler: () => Promise<void>): void {
+    this.disconnectHandler = handler;
   }
 
   public getBrowserInstance(): Browser | null {
@@ -330,15 +341,6 @@ export class CDPService extends EventEmitter {
         // Only install mouse helper in headless mode
         if (this.launchConfig?.options?.headless) {
           installMouseHelper(page, this.launchConfig?.deviceConfig?.device || "desktop");
-        }
-
-        if (this.currentSessionConfig?.timezone) {
-          try {
-            const resolvedTimezone = await this.currentSessionConfig.timezone;
-            await page.emulateTimezone(resolvedTimezone);
-          } catch (error) {
-            this.logger.warn(`Failed to resolve timezone for page emulation: ${error}`);
-          }
         }
 
         if (this.launchConfig?.customHeaders) {
@@ -552,7 +554,7 @@ export class CDPService extends EventEmitter {
       const launchProcess = (async () => {
         const shouldReuseInstance =
           this.browserInstance &&
-          isSimilarConfig(this.launchConfig, config || this.defaultLaunchConfig);
+          (await isSimilarConfig(this.launchConfig, config || this.defaultLaunchConfig));
 
         if (shouldReuseInstance) {
           this.logger.info(
@@ -695,6 +697,8 @@ export class CDPService extends EventEmitter {
           );
         }
 
+        const isHeadless = !!this.launchConfig?.options?.headless;
+
         this.currentSessionConfig = {
           ...this.launchConfig,
           dimensions: this.launchConfig.dimensions || this.fingerprintData?.fingerprint.screen,
@@ -704,7 +708,7 @@ export class CDPService extends EventEmitter {
 
         const extensionPaths = await executeCritical(
           async () => {
-            const defaultExtensions = ["recorder"];
+            const defaultExtensions = isHeadless ? ["recorder"] : [];
             const customExtensions = this.launchConfig!.extensions
               ? [...this.launchConfig!.extensions]
               : [];
@@ -741,8 +745,14 @@ export class CDPService extends EventEmitter {
           const validatedTimezone = await executeOptional(
             this.logger,
             async () => {
-              const tz = await validateTimezone(config.timezone!, this.defaultTimezone);
-              this.logger.debug(`Resolved and validated timezone: ${tz}`);
+              if (this.launchConfig?.skipFingerprintInjection) {
+                this.logger.info(
+                  `Skipping timezone validation as skipFingerprintInjection is enabled`,
+                );
+                return this.defaultTimezone;
+              }
+              const tz = await validateTimezone(this.logger, config.timezone!);
+              this.logger.info(`Resolved and validated timezone: ${tz}`);
               return tz;
             },
             (error) => {
@@ -753,8 +763,6 @@ export class CDPService extends EventEmitter {
           );
           timezone = validatedTimezone ?? this.defaultTimezone;
         }
-
-        const isHeadless = !!this.launchConfig?.options?.headless;
 
         const extensionArgs = extensionPaths.length
           ? [
@@ -769,7 +777,7 @@ export class CDPService extends EventEmitter {
           "--remote-allow-origins=*",
           "--disable-dev-shm-usage",
           "--disable-gpu",
-          "--disable-features=PermissionPromptSurvey,IsolateOrigins,site-per-process,TouchpadAndWheelScrollLatching,TrackingProtection3pcd",
+          "--disable-features=TranslateUI,BlinkGenPropertyTrees,LinuxNonClientFrame,PermissionPromptSurvey,IsolateOrigins,site-per-process,TouchpadAndWheelScrollLatching,TrackingProtection3pcd,InterestFeedContentSuggestions,PrivacySandboxSettings4,AutofillServerCommunication,OptimizationHints,MediaRouter,DialMediaRouteProvider,CertificateTransparencyComponentUpdater,GlobalMediaControls,AudioServiceOutOfProcess,LazyFrameLoading,AvoidUnnecessaryBeforeUnloadCheckSync",
           "--enable-features=Clipboard",
           "--no-default-browser-check",
           "--disable-sync",
@@ -780,13 +788,21 @@ export class CDPService extends EventEmitter {
           "--force-webrtc-ip-handling-policy",
           "--disable-touch-editing",
           "--disable-touch-drag-drop",
-          "--disable-renderer-backgrounding",
           "--disable-client-side-phishing-detection",
           "--disable-default-apps",
           "--disable-component-update",
           "--disable-infobars",
           "--disable-breakpad",
           "--disable-background-networking",
+          "--disable-session-crashed-bubble",
+          "--disable-ipc-flooding-protection",
+          "--disable-popup-blocking",
+          "--disable-prompt-on-repost",
+          "--disable-domain-reliability",
+          "--metrics-recording-only",
+          "--no-pings",
+          "--disable-backing-store-limit",
+          "--password-store=basic",
           ...(shouldDisableSandbox
             ? ["--no-sandbox", "--disable-setuid-sandbox", "--no-zygote"]
             : []),
@@ -800,6 +816,9 @@ export class CDPService extends EventEmitter {
           "--in-process-gpu",
           "--enable-crashpad",
           "--crash-dumps-dir=/tmp/chrome-dumps",
+          "--noerrdialogs",
+          "--force-device-scale-factor=1",
+          "--disable-hang-monitor",
         ];
 
         const headlessArgs = [
@@ -817,7 +836,6 @@ export class CDPService extends EventEmitter {
           `--window-size=${this.launchConfig.dimensions?.width ?? 1920},${
             this.launchConfig.dimensions?.height ?? 1080
           }`,
-          `--timezone=${timezone}`,
           userAgent ? `--user-agent=${userAgent}` : "",
           this.launchConfig.options.proxyUrl
             ? `--proxy-server=${this.launchConfig.options.proxyUrl}`
@@ -843,6 +861,7 @@ export class CDPService extends EventEmitter {
           ignoreDefaultArgs: ["--enable-automation"],
           timeout: 0,
           env: {
+            HOME: os.userInfo().homedir,
             TZ: timezone,
             ...(isHeadless ? {} : { DISPLAY: env.DISPLAY }),
           },
@@ -1257,7 +1276,7 @@ export class CDPService extends EventEmitter {
       return;
     }
 
-    await this.endSession();
+    await this.disconnectHandler();
   }
 
   @traceable
