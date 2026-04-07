@@ -50,62 +50,55 @@ const AD_HOSTS = [
   "ads.linkedin.com",
 ];
 
-export function isAdRequest(url: string): boolean {
+const RE_IMAGE_EXT = /\.(jpg|jpeg|png|webp|svg|ico)(\?.*)?$/i;
+const RE_VIDEO_EXT = /\.(mp4|m4s|m3u8|ts|webm|gif)(\?.*)?$/i;
+const RE_RANGE = /range=\d+-\d+/i;
+
+export function tryParseUrl(url: string): URL | null {
   try {
-    const hostname = new URL(url).hostname;
-    return AD_HOSTS.some((adHost) => hostname === adHost || hostname.endsWith(`.${adHost}`));
+    return new URL(url);
   } catch {
-    return false;
+    return null;
   }
 }
 
-export function isImageRequest(url: string): boolean {
-  try {
-    const { pathname } = new URL(url);
-    const hasImageExt = /\.(jpg|jpeg|png|webp|svg|ico)(\?.*)?$/i.test(pathname);
-    return hasImageExt;
-  } catch {
-    return false;
-  }
+export function isAdRequest(parsed: URL): boolean {
+  const { hostname } = parsed;
+  return AD_HOSTS.some((adHost) => hostname === adHost || hostname.endsWith(`.${adHost}`));
 }
 
-export function isHeavyMediaRequest(url: string): boolean {
-  try {
-    const { pathname, searchParams } = new URL(url);
-    const hasVideoExt = /\.(mp4|m4s|m3u8|ts|webm|gif)(\?.*)?$/i.test(pathname);
-    const isRange = searchParams.has("range") || /range=\d+-\d+/i.test(url);
-    if (hasVideoExt) return true;
-    if (isRange && pathname.includes("/avf/")) return true;
-    return false;
-  } catch {
-    return false;
-  }
+export function isImageRequest(parsed: URL): boolean {
+  return RE_IMAGE_EXT.test(parsed.pathname);
 }
 
-export function isHostBlocked(url: string, blockedHosts?: string[]): boolean {
+export function isHeavyMediaRequest(parsed: URL): boolean {
+  const { pathname, searchParams } = parsed;
+  if (RE_VIDEO_EXT.test(pathname)) return true;
+  const isRange = searchParams.has("range") || RE_RANGE.test(parsed.href);
+  return isRange && pathname.includes("/avf/");
+}
+
+export function isHostBlocked(parsed: URL, blockedHosts?: string[]): boolean {
   if (!blockedHosts?.length) return false;
-  try {
-    const { hostname } = new URL(url);
-    return blockedHosts.some((h) => hostname === h || hostname.endsWith(`.${h}`));
-  } catch {
-    return false;
-  }
+  const { hostname } = parsed;
+  return blockedHosts.some((h) => hostname === h || hostname.endsWith(`.${h}`));
 }
 
-export function isUrlMatchingPatterns(url: string, patterns?: string[]): boolean {
-  if (!patterns?.length) return false;
-  try {
-    const toRegex = (pattern: string) =>
-      new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`, "i");
-    return patterns.some((p) => {
-      try {
-        const re = toRegex(p);
-        return re.test(url);
-      } catch {
-        return url.includes(p);
-      }
-    });
-  } catch {
-    return false;
-  }
+export function compileUrlPatterns(patterns: string[]): RegExp[] {
+  return patterns.map((pattern) => {
+    try {
+      return new RegExp(
+        `^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`,
+        "i",
+      );
+    } catch {
+      // Fallback: escape the entire pattern for literal matching
+      return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    }
+  });
+}
+
+export function isUrlMatchingPatterns(url: string, compiledPatterns?: RegExp[]): boolean {
+  if (!compiledPatterns?.length) return false;
+  return compiledPatterns.some((re) => re.test(url));
 }

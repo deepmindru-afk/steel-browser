@@ -28,10 +28,12 @@ import { loadFingerprintScript } from "../../scripts/index.js";
 import { traceable, tracer } from "../../telemetry/tracer.js";
 import { BrowserEventType, BrowserLauncherOptions, EmitEvent } from "../../types/index.js";
 import {
+  tryParseUrl,
   isAdRequest,
   isHeavyMediaRequest,
   isHostBlocked,
   isUrlMatchingPatterns,
+  compileUrlPatterns,
   isImageRequest,
 } from "../../utils/requests.js";
 import { filterHeaders, getChromeExecutablePath, installMouseHelper } from "../../utils/browser.js";
@@ -67,7 +69,7 @@ import {
   SessionContextType,
   categorizeError,
 } from "./errors/launch-errors.js";
-import { BasePlugin } from "./plugins/core/base-plugin.js";
+import { BasePlugin, ShutdownReason } from "./plugins/core/base-plugin.js";
 import { PluginManager } from "./plugins/core/plugin-manager.js";
 import { isSimilarConfig, validateLaunchConfig, validateTimezone } from "./utils/validation.js";
 import { TargetInstrumentationManager } from "./instrumentation/target-manager.js";
@@ -101,6 +103,7 @@ export class CDPService extends EventEmitter {
   private targetInstrumentationManager: TargetInstrumentationManager;
   private instrumentationLogger: BrowserLogger;
 
+  private compiledUrlPatterns: RegExp[] = [];
   private launchMutators: ((config: BrowserLauncherOptions) => Promise<void> | void)[] = [];
   private shutdownMutators: ((config: BrowserLauncherOptions | null) => Promise<void> | void)[] =
     [];
@@ -373,7 +376,7 @@ export class CDPService extends EventEmitter {
               `[CDPService] Blocked response from file protocol: ${response.url()}`,
             );
             page.close().catch(() => {});
-            this.shutdown();
+            this.endSession(ShutdownReason.SECURITY_VIOLATION);
           }
         });
       }
@@ -383,56 +386,57 @@ export class CDPService extends EventEmitter {
   }
 
   private async handlePageRequest(request: HTTPRequest, page: Page) {
+    const url = request.url();
     const headers = request.headers();
     delete headers["accept-language"]; // Patch to help with headless detection
 
-    const optimize = this.launchConfig?.optimizeBandwidth;
-    const blockedHosts = typeof optimize === "object" ? optimize.blockHosts : undefined;
-    const blockedUrlPatterns = typeof optimize === "object" ? optimize.blockUrlPatterns : undefined;
+    const parsed = tryParseUrl(url);
 
-    if (this.launchConfig?.blockAds && isAdRequest(request.url())) {
-      this.logger.info(`[CDPService] Blocked request to ad related resource: ${request.url()}`);
+    const optimize = this.launchConfig?.optimizeBandwidth;
+    const isOptimizeObject = typeof optimize === "object";
+    const blockedHosts = isOptimizeObject ? optimize.blockHosts : undefined;
+
+    if (parsed && this.launchConfig?.blockAds && isAdRequest(parsed)) {
+      this.logger.info(`[CDPService] Blocked request to ad related resource: ${url}`);
       await request.abort();
       return;
     }
 
     if (
-      isHostBlocked(request.url(), blockedHosts) ||
-      isUrlMatchingPatterns(request.url(), blockedUrlPatterns)
+      (parsed && isHostBlocked(parsed, blockedHosts)) ||
+      isUrlMatchingPatterns(url, this.compiledUrlPatterns)
     ) {
-      this.logger.info(`[CDPService] Blocked request to blocked host or pattern: ${request.url()}`);
+      this.logger.info(`[CDPService] Blocked request to blocked host or pattern: ${url}`);
       await request.abort();
       return;
     }
 
     // Block resources via optimizeBandwidth
-    const blockImages = typeof optimize === "object" ? !!optimize.blockImages : false;
-    const blockMedia = typeof optimize === "object" ? !!optimize.blockMedia : false;
-    const blockStylesheets = typeof optimize === "object" ? !!optimize.blockStylesheets : false;
+    const blockImages = isOptimizeObject ? !!optimize.blockImages : false;
+    const blockMedia = isOptimizeObject ? !!optimize.blockMedia : false;
+    const blockStylesheets = isOptimizeObject ? !!optimize.blockStylesheets : false;
 
-    if (blockImages || blockMedia || blockStylesheets) {
+    if (parsed && (blockImages || blockMedia || blockStylesheets)) {
       const resourceType = request.resourceType();
       if (
-        (blockImages && (resourceType === "image" || isImageRequest(request.url()))) ||
-        (blockMedia && (resourceType === "media" || isHeavyMediaRequest(request.url()))) ||
+        (blockImages && (resourceType === "image" || isImageRequest(parsed))) ||
+        (blockMedia && (resourceType === "media" || isHeavyMediaRequest(parsed))) ||
         (blockStylesheets && resourceType === "stylesheet")
       ) {
         this.logger.info(
           `[CDPService] Blocked ${resourceType} resource due to optimizeBandwidth (${
             blockImages ? "blockImages" : ""
-          }${blockMedia ? "blockMedia" : ""}${
-            blockStylesheets ? "blockStylesheets" : ""
-          }): ${request.url()}`,
+          }${blockMedia ? "blockMedia" : ""}${blockStylesheets ? "blockStylesheets" : ""}): ${url}`,
         );
         await request.abort();
         return;
       }
     }
 
-    if (request.url().startsWith("file://")) {
-      this.logger.error(`[CDPService] Blocked request to file protocol: ${request.url()}`);
+    if (url.startsWith("file://")) {
+      this.logger.error(`[CDPService] Blocked request to file protocol: ${url}`);
       page.close().catch(() => {});
-      this.shutdown();
+      this.endSession(ShutdownReason.SECURITY_VIOLATION);
     } else {
       await request.continue({ headers });
     }
@@ -452,16 +456,16 @@ export class CDPService extends EventEmitter {
   }
 
   @traceable
-  public async shutdown(): Promise<void> {
+  public async shutdown(reason: ShutdownReason): Promise<void> {
     this.shuttingDown = true;
-    this.logger.info(`[CDPService] Shutting down and cleaning up resources`);
+    this.logger.info(`[CDPService] Shutting down and cleaning up resources (reason: ${reason})`);
 
     try {
       if (this.browserInstance) {
         await this.pluginManager.onBrowserClose(this.browserInstance);
       }
 
-      await this.pluginManager.onShutdown();
+      await this.pluginManager.onShutdown(reason);
 
       this.removeAllHandlers();
       await this.browserInstance?.close();
@@ -523,7 +527,7 @@ export class CDPService extends EventEmitter {
         return await this.launchInternal(config);
       } catch (error) {
         try {
-          await this.pluginManager.onShutdown();
+          await this.pluginManager.onShutdown(ShutdownReason.LAUNCH_FAILURE);
           await this.shutdownHook();
         } catch (e) {
           this.logger.warn(
@@ -561,6 +565,11 @@ export class CDPService extends EventEmitter {
             "[CDPService] Reusing existing browser instance with default configuration.",
           );
           this.launchConfig = config || this.defaultLaunchConfig;
+
+          const reuseOptimize = this.launchConfig.optimizeBandwidth;
+          const reusePatterns =
+            typeof reuseOptimize === "object" ? reuseOptimize.blockUrlPatterns : undefined;
+          this.compiledUrlPatterns = reusePatterns?.length ? compileUrlPatterns(reusePatterns) : [];
 
           await executeCritical(
             async () => this.refreshPrimaryPage(),
@@ -600,12 +609,17 @@ export class CDPService extends EventEmitter {
           );
           await executeBestEffort(
             this.logger,
-            async () => this.shutdown(),
+            async () => this.shutdown(ShutdownReason.RELAUNCH),
             "Error during shutdown before launch",
           );
         }
 
         this.launchConfig = config || this.defaultLaunchConfig;
+
+        const optimize = this.launchConfig.optimizeBandwidth;
+        const rawPatterns = typeof optimize === "object" ? optimize.blockUrlPatterns : undefined;
+        this.compiledUrlPatterns = rawPatterns?.length ? compileUrlPatterns(rawPatterns) : [];
+
         this.logger.info("[CDPService] Launching new browser instance.");
 
         // Validate configuration
@@ -771,7 +785,9 @@ export class CDPService extends EventEmitter {
             ]
           : [];
 
-        const shouldDisableSandbox = typeof process.getuid === "function" && process.getuid() === 0;
+        const shouldDisableSandbox =
+          env.DISABLE_CHROME_SANDBOX ||
+          (typeof process.getuid === "function" && process.getuid() === 0);
 
         const staticDefaultArgs = [
           "--remote-allow-origins=*",
@@ -1248,24 +1264,56 @@ export class CDPService extends EventEmitter {
     this.currentSessionConfig = sessionConfig;
     this.trackedOrigins.clear(); // Clear tracked origins when starting a new session
 
-    return this.launch(sessionConfig);
+    // Recreate target instrumentation manager with session-specific options
+    this.targetInstrumentationManager = new TargetInstrumentationManager(
+      this.instrumentationLogger,
+      this.logger,
+      { dangerouslyLogRequestDetails: sessionConfig.dangerouslyLogRequestDetails },
+    );
+
+    // Notify plugins that a session is starting, before any launch/reuse work begins.
+    // This is the earliest point where session context (e.g. sessionId) is available.
+    await this.pluginManager.onSessionStart(sessionConfig);
+
+    try {
+      return await this.launch(sessionConfig);
+    } catch (error) {
+      // If launch fails, ensure we still notify plugins about session end to allow for proper cleanup
+      await this.pluginManager.onBeforeSessionEnd(sessionConfig);
+      await this.pluginManager.onSessionEnd(sessionConfig);
+      await this.pluginManager.onAfterSessionEnd(sessionConfig);
+      throw error;
+    }
   }
 
   @traceable
-  public async endSession(): Promise<void> {
+  public async endSession(reason: ShutdownReason = ShutdownReason.SESSION_END): Promise<void> {
     this.logger.info("Ending current session and resetting to default configuration.");
     const sessionConfig = this.currentSessionConfig!;
 
     this.sessionContext = await this.getBrowserState().catch(() => null);
 
-    await this.shutdown();
-    await this.pluginManager.onSessionEnd(sessionConfig);
-    this.currentSessionConfig = null;
-    this.sessionContext = null;
-    this.trackedOrigins.clear();
+    try {
+      await this.pluginManager.onBeforeSessionEnd(sessionConfig);
+      await this.shutdown(reason);
+      await this.pluginManager.onSessionEnd(sessionConfig);
+      this.currentSessionConfig = null;
+      this.sessionContext = null;
+      this.trackedOrigins.clear();
 
-    this.instrumentationLogger.resetContext();
+      this.instrumentationLogger.resetContext();
 
+      // Reset target instrumentation manager to clear session-specific options
+      // (e.g. dangerouslyLogRequestDetails) so they don't leak into the idle browser
+      this.targetInstrumentationManager = new TargetInstrumentationManager(
+        this.instrumentationLogger,
+        this.logger,
+      );
+    } finally {
+      await this.pluginManager.onAfterSessionEnd(sessionConfig);
+    }
+
+    // Relaunch the idle browser
     await this.launch(this.defaultLaunchConfig);
   }
 

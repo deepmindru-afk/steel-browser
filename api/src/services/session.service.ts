@@ -11,6 +11,7 @@ import { BrowserLauncherOptions, OptimizeBandwidthOptions } from "../types/index
 import { IProxyServer, ProxyServer } from "../utils/proxy.js";
 import { getBaseUrl, getUrl } from "../utils/url.js";
 import { CDPService } from "./cdp/cdp.service.js";
+import { ShutdownReason } from "./cdp/plugins/core/base-plugin.js";
 import { CookieData } from "./context/types.js";
 import { FileService } from "./file.service.js";
 import { SeleniumService } from "./selenium.service.js";
@@ -106,6 +107,7 @@ export class SessionService {
     userPreferences?: Record<string, any>;
     deviceConfig?: { device: "desktop" | "mobile" };
     headless?: boolean;
+    dangerouslyLogRequestDetails?: boolean;
   }): Promise<SessionDetails> {
     const {
       sessionId,
@@ -125,6 +127,7 @@ export class SessionService {
       userPreferences,
       deviceConfig,
       headless,
+      dangerouslyLogRequestDetails,
     } = options;
 
     // start fetching timezone as early as possible
@@ -139,7 +142,17 @@ export class SessionService {
     }
 
     // If dimensions not provided, get from CDP service
-    const finalDimensions = dimensions || this.cdpService.getDimensions();
+    const MIN_MOBILE_WIDTH = 508;
+    const MIN_MOBILE_HEIGHT = 1074;
+    const isMobileDevice = deviceConfig?.device === "mobile";
+    const resolvedDimensions = dimensions || this.cdpService.getDimensions();
+    const finalDimensions =
+      isMobileDevice && resolvedDimensions
+        ? {
+            width: Math.max(resolvedDimensions.width, MIN_MOBILE_WIDTH),
+            height: Math.max(resolvedDimensions.height, MIN_MOBILE_HEIGHT),
+          }
+        : resolvedDimensions;
 
     await this.resetSessionInfo({
       id: sessionId || uuidv4(),
@@ -148,6 +161,7 @@ export class SessionService {
       solveCaptcha: false,
       dimensions: finalDimensions,
       isSelenium,
+      deviceConfig,
     });
 
     const userDataDir =
@@ -200,17 +214,18 @@ export class SessionService {
       extensions: extensions || [],
       logSinkUrl,
       timezone: timezonePromise,
-      dimensions,
+      dimensions: finalDimensions,
       userDataDir,
       userPreferences: mergedUserPreferences,
       extra,
       credentials,
       skipFingerprintInjection,
       deviceConfig,
+      dangerouslyLogRequestDetails,
     };
 
     if (isSelenium) {
-      await this.cdpService.shutdown();
+      await this.cdpService.shutdown(ShutdownReason.MODE_SWITCH);
       await this.seleniumService.launch(browserLauncherOptions);
 
       Object.assign(this.activeSession, {
@@ -221,6 +236,7 @@ export class SessionService {
           userAgent ||
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         dimensions: this.cdpService.getDimensions(),
+        deviceConfig,
       });
 
       return this.activeSession;
@@ -236,6 +252,7 @@ export class SessionService {
           this.cdpService.getUserAgent() ||
           "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         dimensions: this.cdpService.getDimensions(),
+        deviceConfig,
       });
     }
 
