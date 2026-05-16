@@ -7,7 +7,11 @@ import { v4 as uuidv4 } from "uuid";
 import { env } from "../env.js";
 import { BrowserFingerprintWithHeaders } from "fingerprint-generator";
 import { CredentialsOptions, SessionDetails } from "../modules/sessions/sessions.schema.js";
-import { BrowserLauncherOptions, OptimizeBandwidthOptions } from "../types/index.js";
+import {
+  BrowserLaunchExtra,
+  BrowserLauncherOptions,
+  OptimizeBandwidthOptions,
+} from "../types/index.js";
 import { IProxyServer, ProxyServer } from "../utils/proxy.js";
 import { getBaseUrl, getUrl } from "../utils/url.js";
 import { CDPService } from "./cdp/cdp.service.js";
@@ -46,7 +50,10 @@ const defaultSession = {
   solveCaptcha: false,
 };
 
-export type ProxyFactory = (proxyUrl: string) => Promise<IProxyServer> | IProxyServer;
+export type ProxyFactory = (
+  proxyUrl: string,
+  options?: OptimizeBandwidthOptions,
+) => Promise<IProxyServer> | IProxyServer;
 
 export class SessionService {
   private logger: FastifyBaseLogger;
@@ -101,11 +108,12 @@ export class SessionService {
     extensions?: string[];
     timezone?: string;
     dimensions?: { width: number; height: number };
-    extra?: Record<string, Record<string, string>>;
+    extra?: BrowserLaunchExtra;
     credentials: CredentialsOptions;
     skipFingerprintInjection?: boolean;
     userPreferences?: Record<string, any>;
     deviceConfig?: { device: "desktop" | "mobile" };
+    fullscreen?: boolean;
     headless?: boolean;
     dangerouslyLogRequestDetails?: boolean;
   }): Promise<SessionDetails> {
@@ -126,6 +134,7 @@ export class SessionService {
       skipFingerprintInjection,
       userPreferences,
       deviceConfig,
+      fullscreen,
       headless,
       dangerouslyLogRequestDetails,
     } = options;
@@ -170,11 +179,6 @@ export class SessionService {
         : env.CHROME_USER_DATA_DIR || path.join(os.tmpdir(), "steel-chrome");
     await mkdir(userDataDir, { recursive: true });
 
-    if (proxyUrl) {
-      this.activeSession.proxyServer = await this.proxyFactory(proxyUrl);
-      await this.activeSession.proxyServer.listen();
-    }
-
     const defaultUserPreferences = {
       plugins: {
         always_open_pdf_externally: true,
@@ -201,6 +205,11 @@ export class SessionService {
 
     const normalizedOptimize = normalizeOptimizeBandwidth(optimizeBandwidth);
 
+    if (proxyUrl) {
+      this.activeSession.proxyServer = await this.proxyFactory(proxyUrl, normalizedOptimize);
+      await this.activeSession.proxyServer.listen();
+    }
+
     const browserLauncherOptions: BrowserLauncherOptions = {
       options: {
         headless: headless ?? env.CHROME_HEADLESS,
@@ -221,6 +230,7 @@ export class SessionService {
       credentials,
       skipFingerprintInjection,
       deviceConfig,
+      fullscreen,
       dangerouslyLogRequestDetails,
     };
 
